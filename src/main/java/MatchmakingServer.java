@@ -2,6 +2,7 @@ package main.java;
 
 import java.io.*;
 import java.net.*;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -12,6 +13,7 @@ public class MatchmakingServer {
     private static final int PORT = 8080;
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
+    // Maps SessionID -> Session Room
     private static final ConcurrentHashMap<String, SessionRoom> rooms = new ConcurrentHashMap<>();
 
     private static void broadcastClientCount(SessionRoom room) {
@@ -24,9 +26,18 @@ public class MatchmakingServer {
     }
 
     public static void main(String[] args) {
+        // Read dynamic port from cloud environment variable if available
+        String portEnv = System.getenv("PORT");
+        int port = PORT;
+        if (portEnv != null && !portEnv.trim().isEmpty()) {
+            try {
+                port = Integer.parseInt(portEnv.trim());
+            } catch (NumberFormatException ignored) {}
+        }
+
         log("INFO", "[RELAY SERVER] Initializing matchmaking server...");
-        try (ServerSocket serverSocket = new ServerSocket(PORT)) {
-            log("INFO", "[RELAY SERVER] Successfully started and listening on port " + PORT);
+        try (ServerSocket serverSocket = new ServerSocket(port)) {
+            log("INFO", "[RELAY SERVER] Successfully started and listening on port " + port);
 
             while (true) {
                 Socket socket = serverSocket.accept();
@@ -64,26 +75,50 @@ public class MatchmakingServer {
             SessionRoom room = null;
 
             try {
-                BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
-                PrintWriter writer = new PrintWriter(socket.getOutputStream(), true);
+                BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
 
-                String authLine = reader.readLine();
-                if (authLine == null || !authLine.startsWith("AUTH|")) {
-                    log("WARN", "[AUTH] Invalid or empty handshake received from " + remoteAddress + ". Closing connection.");
+                // Read the first line of the incoming socket stream
+                String firstLine = reader.readLine();
+                if (firstLine == null) {
+                    socket.close();
                     return;
                 }
 
-                String[] parts = authLine.split("\\|");
+                // 1. Check if this is an HTTP health check probe from a cloud platform (e.g., Render/Railway)
+                if (firstLine.startsWith("GET ") || firstLine.startsWith("HEAD ")) {
+                    log("INFO", "[HEALTH CHECK] Received HTTP probe from " + remoteAddress);
+                    OutputStream rawOut = socket.getOutputStream();
+                    String httpResponse = "HTTP/1.1 200 OK\r\n" +
+                            "Content-Type: text/plain; charset=utf-8\r\n" +
+                            "Content-Length: 2\r\n" +
+                            "Connection: close\r\n\r\n" +
+                            "OK";
+                    rawOut.write(httpResponse.getBytes(StandardCharsets.UTF_8));
+                    rawOut.flush();
+                    socket.close();
+                    return;
+                }
+
+                // 2. Validate standard Jam Session Auth Handshake
+                if (!firstLine.startsWith("AUTH|")) {
+                    log("WARN", "[AUTH] Invalid handshake received from " + remoteAddress + ": " + firstLine);
+                    socket.close();
+                    return;
+                }
+
+                String[] parts = firstLine.split("\\|");
                 if (parts.length < 3) {
-                    log("WARN", "[AUTH] Malformed handshake format from " + remoteAddress + ": " + authLine);
+                    log("WARN", "[AUTH] Malformed handshake format from " + remoteAddress + ": " + firstLine);
+                    socket.close();
                     return;
                 }
 
-                role = parts[1];
+                role = parts[1]; // HOST or CLIENT
                 sessionId = parts[2];
 
                 if (!"HOST".equals(role) && !"CLIENT".equals(role)) {
                     log("WARN", "[AUTH] Unknown role '" + role + "' specified by " + remoteAddress);
+                    socket.close();
                     return;
                 }
 
@@ -99,15 +134,18 @@ public class MatchmakingServer {
                     broadcastClientCount(room);
                 }
 
+                // Relay loop
                 String line;
                 while ((line = reader.readLine()) != null) {
                     if ("HOST".equals(role)) {
+                        // Host sent a message -> broadcast to all clients in this room
                         for (Socket client : room.clientSockets) {
                             try {
                                 new PrintWriter(client.getOutputStream(), true).println(line);
                             } catch (IOException ignored) {}
                         }
                     } else {
+                        // Client sent a message -> forward to host
                         if (room.hostSocket != null && !room.hostSocket.isClosed()) {
                             try {
                                 new PrintWriter(room.hostSocket.getOutputStream(), true).println(line);
